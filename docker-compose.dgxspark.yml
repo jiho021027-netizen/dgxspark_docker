@@ -1,0 +1,150 @@
+name: dgxspark-robocasa365
+
+x-common-env: &common-env
+  MUJOCO_GL: egl
+  PYOPENGL_PLATFORM: egl
+  NVIDIA_VISIBLE_DEVICES: all
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+  PYTHONUNBUFFERED: "1"
+  PYTORCH_NVML_BASED_CUDA_CHECK: "0"
+  TOKENIZERS_PARALLELISM: "false"
+  NO_ALBUMENTATIONS_UPDATE: "1"
+  HF_HOME: /cache/huggingface
+  HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+  TRANSFORMERS_CACHE: /cache/huggingface/hub
+  HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-1}"
+  TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-1}"
+  CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0}"
+  TORCH_COMPILE_DISABLE: "1"
+  TORCHDYNAMO_DISABLE: "1"
+  TORCHINDUCTOR_DISABLE: "1"
+  PYTORCH_NVFUSER_DISABLE: "1"
+
+x-common-volumes: &common-volumes
+  - /home/edgexpert01/projects/checkpoints:/checkpoints:ro
+  - /home/edgexpert01/projects/datasets:/datasets:ro
+  - /home/edgexpert01/projects/robocasa/robocasa/models/assets:/assets/robocasa:ro
+  - /home/edgexpert01/projects/rldx1_artifacts/logs:/logs
+  - /home/edgexpert01/projects/rldx1_artifacts/videos:/videos
+  - /home/edgexpert01/.cache/huggingface:/cache/huggingface
+
+services:
+  rldx1:
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: Dockerfile.rldx1
+      args:
+        BASE_IMAGE: "${BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.05-py3}"
+        INSTALL_FLASH_ATTN: "${INSTALL_FLASH_ATTN:-0}"
+    image: rldx1-dgxspark:dev
+    network_mode: host
+    ipc: host
+    shm_size: "32gb"
+    gpus: all
+    environment:
+      <<: *common-env
+      PYTHONPATH: /opt/rldx1:/opt/robocasa365_src:/opt/robosuite_src
+      RLDX_ATTN_IMPL: sdpa
+      RLDX_DISABLE_CUDA_JIT_REDUCTIONS: "1"
+      MODEL_PATH: "${RLDX_MODEL_PATH:-/checkpoints/RLDX-1-FT-RC365}"
+      SERVER_PORT: "${RLDX_SERVER_PORT:-20000}"
+      TASK_NAME: "${RLDX_TASK_NAME:-PickPlaceCounterToCabinet}"
+    volumes:
+      - /home/edgexpert01/projects/checkpoints:/checkpoints:ro
+      - /home/edgexpert01/projects/datasets:/datasets:ro
+      - /home/edgexpert01/projects/robocasa/robocasa/models/assets:/assets/robocasa:ro
+      - /home/edgexpert01/projects/rldx1_artifacts/logs:/logs
+      - /home/edgexpert01/projects/rldx1_artifacts/videos:/videos
+      - /home/edgexpert01/.cache/huggingface:/cache/huggingface
+      - /home/edgexpert01/projects/RLDX-1:/opt/rldx1:ro
+      - /home/edgexpert01/projects/robocasa:/opt/robocasa365_src:ro
+      - /home/edgexpert01/projects/robosuite:/opt/robosuite_src:ro
+    working_dir: /opt/rldx1
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /logs /videos
+        "$${RLDX_PYTHON}" rldx/eval/run_rldx_server.py \
+          --model-path "$${MODEL_PATH}" \
+          --embodiment-tag GENERAL_EMBODIMENT \
+          --host 127.0.0.1 \
+          --port "$${SERVER_PORT}" \
+          --use-sim-policy-wrapper \
+          > /logs/rldx1_server.log 2>&1 &
+        spid=$$!
+        for i in $(seq 1 180); do
+          if bash -lc ":</dev/tcp/127.0.0.1/$${SERVER_PORT}" 2>/dev/null; then break; fi
+          kill -0 "$${spid}"
+          sleep 5
+        done
+        "$${PY365}" rldx/eval/rollout_policy.py \
+          --policy_client_host 127.0.0.1 \
+          --policy_client_port "$${SERVER_PORT}" \
+          --env_name "robocasa/$${TASK_NAME}" \
+          --robocasa_split target \
+          --n_episodes 1 \
+          --n_envs 1 \
+          --max_episode_steps 50 \
+          --video_dir /videos/rldx1_$${TASK_NAME} \
+          > /logs/rldx1_rollout.log 2>&1
+        code=$$?
+        kill "$${spid}" 2>/dev/null || true
+        exit "$${code}"
+    stdin_open: true
+    tty: true
+
+  worlddreamer:
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: Dockerfile.worlddreamer
+      args:
+        BASE_IMAGE: "${BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.05-py3}"
+        INSTALL_FLASH_ATTN: "${INSTALL_FLASH_ATTN:-0}"
+    image: worlddreamer-dgxspark:dev
+    network_mode: host
+    ipc: host
+    shm_size: "32gb"
+    gpus: all
+    environment:
+      <<: *common-env
+      PYTHONPATH: /opt/worlddreamer/src:/opt/worlddreamer:/opt/robocasa365_src:/opt/robosuite_src
+      WMD_ROBO_RAYROPE_GEOM_STRICT: "1"
+      MODEL_PATH: "${WMD_MODEL_PATH:-/checkpoints/world_dreamer-robocasa365-multi_task}"
+      SERVER_PORT: "${WMD_SERVER_PORT:-20201}"
+      TASK_SET: "${WMD_TASK_SET:-composite_unseen}"
+    volumes:
+      - /home/edgexpert01/projects/checkpoints:/checkpoints:ro
+      - /home/edgexpert01/projects/datasets:/datasets:ro
+      - /home/edgexpert01/projects/robocasa/robocasa/models/assets:/assets/robocasa:ro
+      - /home/edgexpert01/projects/rldx1_artifacts/logs:/logs
+      - /home/edgexpert01/projects/rldx1_artifacts/videos:/videos
+      - /home/edgexpert01/.cache/huggingface:/cache/huggingface
+      - /home/edgexpert01/projects/robocasa:/opt/robocasa365_src:ro
+      - /home/edgexpert01/projects/robosuite:/opt/robosuite_src:ro
+      - /home/edgexpert01/projects/world_dreamer_server-robocasa365-multi_task:/opt/worlddreamer:ro
+    working_dir: /opt/worlddreamer
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /logs /videos /logs/worlddreamer_output
+        SERVER_PYTHON="$${SERVER_PYTHON}" PY365="$${PY365}" \
+        bash scripts/eval_robocasa365.sh \
+          --model-path "$${MODEL_PATH}" \
+          --task-yaml configs/task_sets.yaml \
+          --task-set "$${TASK_SET}" \
+          --split target \
+          --n-episodes 1 \
+          --n-envs 1 \
+          --n-action-steps 8 \
+          --max-episode-steps 50 \
+          --server-port "$${SERVER_PORT}" \
+          --server-warmup-sec 300 \
+          --output-root /logs/worlddreamer_output
+    stdin_open: true
+    tty: true

@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.7
+#
+# Build context: this Docker bundle directory.
+# Target platform: linux/arm64 on DGX Spark / GB10.
+#
+# Checkpoints, datasets, RoboCasa assets, logs, and videos are runtime mounts.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.05-py3
+FROM --platform=linux/arm64 ${BASE_IMAGE}
+
+ARG INSTALL_FLASH_ATTN=0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    MUJOCO_GL=egl \
+    PYOPENGL_PLATFORM=egl \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    TOKENIZERS_PARALLELISM=false \
+    NO_ALBUMENTATIONS_UPDATE=1 \
+    WMD_ROBO_RAYROPE_GEOM_STRICT=1 \
+    TORCH_COMPILE_DISABLE=1 \
+    TORCHDYNAMO_DISABLE=1 \
+    TORCHINDUCTOR_DISABLE=1 \
+    PYTORCH_NVFUSER_DISABLE=1 \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    FLASH_ATTN_CUDA_ARCHS=120
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git git-lfs curl wget ca-certificates \
+      build-essential cmake ninja-build pkg-config patchelf \
+      ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+      libegl1 libegl1-mesa-dev libgl1 libglvnd0 libgles2 libosmesa6 \
+      libx11-6 libxext6 libxrender1 libsm6 libglib2.0-0 libglfw3 \
+      libhdf5-dev libxml2-dev libxslt1-dev libusb-1.0-0 libhidapi-hidraw0 \
+      python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /opt
+RUN mkdir -p /opt/worlddreamer /opt/robocasa365_src
+
+# WorldDreamer model-server env, matching pyproject.toml (Python 3.10).
+RUN uv venv --seed --python 3.10 /opt/venvs/worlddreamer && \
+    . /opt/venvs/worlddreamer/bin/activate && \
+    python -m pip install --upgrade pip setuptools wheel packaging && \
+    pip install \
+      "torch>=2.7" "torchvision>=0.22" \
+      --extra-index-url https://download.pytorch.org/whl/cu128 && \
+    pip install \
+      "accelerate>=0.34" "albumentations==1.4.18" "av>=15.0.0" \
+      "diffusers==0.35.1" "dm-tree==0.1.8" "gymnasium>=1.2.0" \
+      "huggingface-hub>=0.26" "msgpack>=1.1.0" "numpy>=1.26,<2" \
+      "opencv-python-headless>=4.11" "packaging>=24.0" "pandas>=2.2" \
+      "peft==0.17.1" "Pillow>=10.0" "pyzmq>=27.0" "PyYAML>=6.0" \
+      "requests>=2.32" "safetensors>=0.4.5" "scipy>=1.15" \
+      "tqdm>=4.66" "transformers==4.57.0" && \
+    if [ "${INSTALL_FLASH_ATTN}" = "1" ]; then \
+      FLASH_ATTENTION_FORCE_BUILD=TRUE pip install \
+        "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3" \
+        --no-build-isolation; \
+    fi
+
+# RoboCasa365 rollout-client env. Separated because RoboCasa365 setup.py
+# requires numpy==2.2.5 and mujoco==3.3.1 while WorldDreamer model deps use
+# numpy<2.
+RUN uv venv --seed --python 3.10 /opt/venvs/robocasa365 && \
+    . /opt/venvs/robocasa365/bin/activate && \
+    unset PIP_CONSTRAINT && \
+    python -m pip install --upgrade pip setuptools wheel && \
+    pip install "numpy==2.2.5" "numba==0.61.2" "scipy==1.15.3" \
+      "mujoco==3.3.1" "robosuite>=1.5.0" "gymnasium>=1.2.0" \
+      pygame Pillow opencv-python-headless pyyaml tqdm termcolor imageio h5py lxml \
+      hidapi "tianshou==0.4.10" "pyzmq>=27.0" "msgpack>=1.1.0" \
+      "pandas>=2.2" "albumentations==1.4.18"
+
+ENV SERVER_PYTHON=/opt/venvs/worlddreamer/bin/python \
+    PY365=/opt/venvs/robocasa365/bin/python \
+    PYTHONPATH=/opt/worlddreamer/src:/opt/worlddreamer:/opt/robocasa365_src:${PYTHONPATH} \
+    HF_HOME=/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/cache/huggingface/hub \
+    TRANSFORMERS_CACHE=/cache/huggingface/hub
+
+WORKDIR /opt/worlddreamer
+VOLUME ["/checkpoints", "/datasets", "/assets", "/logs", "/videos", "/cache"]
+
+CMD ["/bin/bash"]
